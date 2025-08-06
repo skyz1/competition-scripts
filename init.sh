@@ -1,11 +1,17 @@
 #!/bin/bash
 
-# Read the username and password from the config/main file
-DOMAIN=$(sed -n '1p' config/main)
-ENABLE_HTTPS=$(sed -n '2p' config/main)
-USERNAME=$(sed -n '3p' config/main)
-PASSWORD=$(sed -n '4p' config/main)
-MODULES=$(sed -n '5p' config/main)
+# Ensure jq is installed
+if ! command -v jq &>/dev/null; then
+  echo "jq is required but not installed. Aborting."
+  exit 1
+fi
+
+CONFIG_FILE="config/config.json"
+
+DOMAIN=$(jq -r '.domain' "$CONFIG_FILE")
+ENABLE_HTTPS=$(jq -r '.enable_https' "$CONFIG_FILE")
+USERNAME=$(jq -r '.username' "$CONFIG_FILE")
+PASSWORD=$(jq -r '.password' "$CONFIG_FILE")
 
 export GITEA_HOSTNAME=$DOMAIN
 export ENABLE_HTTPS=$ENABLE_HTTPS
@@ -21,12 +27,11 @@ else
   export REGISTRY_PORT=5000
 fi
 
-# create various config and creation files
-# Start Traefik and Gitea using Docker Compose
+# Start Traefik and Gitea
 REGISTRY_PORT=$REGISTRY_PORT GITEA_HOSTNAME=$DOMAIN GITEA_PROTOCOL=$GITEA_PROTOCOL ENTRYPOINT=$ENTRYPOINT ENABLE_HTTPS=$ENABLE_HTTPS docker compose -f traefik.yaml up -d --remove-orphans
 GITEA_HOSTNAME=$DOMAIN GITEA_PROTOCOL=$GITEA_PROTOCOL ENTRYPOINT=$ENTRYPOINT ENABLE_HTTPS=$ENABLE_HTTPS docker compose -f gitea.yaml up -d
 
-# Wait for Gitea to start
+# Wait for Gitea
 function wait_for_gitea() {
   local retries=10
   local wait=5
@@ -42,50 +47,45 @@ function wait_for_gitea() {
     count=$((count + 1))
   done
 }
-
-# Wait for Gitea to start
 wait_for_gitea
 
-# Create a new Gitea user using the username and password from the passwd file
+# Create main admin user
 docker exec gitea su -c "/app/gitea/gitea admin user create --username $USERNAME --password $PASSWORD --email $USERNAME@example.com --admin" git
 
-# Generate a registration token for the Gitea runner
+# Generate registration token
 REGISTRATION_TOKEN=$(docker exec gitea su -c '/app/gitea/gitea actions generate-runner-token' git)
 export REGISTRATION_TOKEN=$REGISTRATION_TOKEN
-
 echo "Registration Token: $REGISTRATION_TOKEN"
 
-# Start the Gitea runner with the registration token
+# Start Gitea runner
 REGISTRATION_TOKEN=$REGISTRATION_TOKEN docker compose -f gitea-runner.yaml up -d
 
-#### START GTI PREP
+# Create PAT and organizations
 GITEA_URL="$GITEA_PROTOCOL://git.$DOMAIN"
-GITEA_TOKEN=$(./create_pat.sh "$GITEA_PROTOCOL://git.$DOMAIN" "$USERNAME" "$PASSWORD")
+GITEA_TOKEN=$(./create_pat.sh "$GITEA_URL" "$USERNAME" "$PASSWORD")
 
-# create org for demo repos
-response=$(curl -s -k -X POST "$GITEA_URL/api/v1/orgs" \
-    -H "Content-Type: application/json" \
-    -H "Authorization: token $GITEA_TOKEN" \
-    -d '{
-        "username": "frameworks",
-        "full_name": "frameworks"
-    }')
+curl -s -k -X POST "$GITEA_URL/api/v1/orgs" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: token $GITEA_TOKEN" \
+  -d '{"username": "frameworks", "full_name": "frameworks"}'
 
-./create_organisation.sh $GITEA_TOKEN $GITEA_URL "images"
-./create_organisation.sh $GITEA_TOKEN $GITEA_URL "frameworks"
+./create_organisation.sh "$GITEA_TOKEN" "$GITEA_URL" "images"
+./create_organisation.sh "$GITEA_TOKEN" "$GITEA_URL" "frameworks"
+./create_team.sh "$GITEA_TOKEN" "$GITEA_URL" "frameworks" "competitors" false
 
-./create_team.sh $GITEA_TOKEN $GITEA_URL "frameworks" "competitors" false
+# Import frameworks
+jq -c '.frameworks[]' "$CONFIG_FILE" | while read -r framework; do
+  name=$(echo "$framework" | jq -r '.name')
+  url=$(echo "$framework" | jq -r '.url')
 
-./import_framework.sh $GITEA_TOKEN $USERNAME $PASSWORD "git.$DOMAIN" "https://github.com/skill-setup/laravel-base.git" "laravel"
-./import_framework.sh $GITEA_TOKEN $USERNAME $PASSWORD "git.$DOMAIN" "https://github.com/skill-setup/vuejs-base.git" "vuejs"
-./import_framework.sh $GITEA_TOKEN $USERNAME $PASSWORD "git.$DOMAIN" "https://github.com/skill-setup/react-vite-js-base.git" "react"
-./import_framework.sh $GITEA_TOKEN $USERNAME $PASSWORD "git.$DOMAIN" "https://github.com/skill-setup/vanilla-base.git" "vanillajs"
-./import_framework.sh $GITEA_TOKEN $USERNAME $PASSWORD "git.$DOMAIN" "https://github.com/skill-setup/next-js-base.git" "nextjs"
+  ./import_framework.sh "$GITEA_TOKEN" "$USERNAME" "$PASSWORD" "git.$DOMAIN" "$url" "$name"
+done
 
+# Docker login
 docker pull nginx:latest > /dev/null 2>&1
-docker login -u $USERNAME -p $PASSWORD git.$DOMAIN > /dev/null 2>&1
+docker login -u "$USERNAME" -p "$PASSWORD" "git.$DOMAIN" > /dev/null 2>&1
 
-# Generate competitors.yaml
+# Prepare YAML & SQL
 cat <<EOF > competitors.yaml
 services:
 EOF
@@ -93,16 +93,19 @@ EOF
 cat <<EOF > config/mysql/competitors.sql
 EOF
 
-# initialize the basic modules
-tail -n +6 config/main | while read -r user pass sub; do
+# Handle competitors
+jq -c '.competitors[]' "$CONFIG_FILE" | while read -r competitor; do
+  user=$(echo "$competitor" | jq -r '.username')
+  pass=$(echo "$competitor" | jq -r '.password')
+  modules=$(echo "$competitor" | jq -r '.modules[]')
 
-  docker exec gitea su -c '/app/gitea/gitea admin user create --username '$user' --password '$pass' --email '$user@example.com' --must-change-password=false' git
-  ./add_user_to_team.sh $GITEA_URL $GITEA_TOKEN "frameworks" "competitors" ${user}
+  docker exec gitea su -c "/app/gitea/gitea admin user create --username $user --password $pass --email $user@example.com --must-change-password=false" git
+  ./add_user_to_team.sh "$GITEA_URL" "$GITEA_TOKEN" "frameworks" "competitors" "$user"
 
-  for module in $MODULES; do
+  for module in $modules; do
     echo "Processing module: $module for $user"
 
-  cat <<EOF >> competitors.yaml
+    cat <<EOF >> competitors.yaml
   ${user}_${module}:
     image: git.${DOMAIN}/${user}/${module}:latest
     container_name: ${user}_${module}
@@ -111,18 +114,17 @@ tail -n +6 config/main | while read -r user pass sub; do
       - gitea
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.${user}_${module}.rule=Host(\`${sub}-${module}.$DOMAIN\`)"
+      - "traefik.http.routers.${user}_${module}.rule=Host(\`${user}-${module}.$DOMAIN\`)"
       - "traefik.http.routers.${user}_${module}.entrypoints=${ENTRYPOINT}"
       - "traefik.http.routers.${user}_${module}.tls=${ENABLE_HTTPS}"
       - "traefik.http.services.${user}_${module}.loadbalancer.server.port=80"
       - "com.centurylinklabs.watchtower.enable=true"
 EOF
-    
-    echo "pushing inital container"
-    docker tag nginx:latest git.$DOMAIN/$user/$module:latest
-    docker push git.$DOMAIN/$user/$module #> /dev/null 2>&1
 
-  cat <<EOF >> config/mysql/competitors.sql
+    docker tag nginx:latest git.$DOMAIN/$user/$module:latest
+    docker push git.$DOMAIN/$user/$module
+
+    cat <<EOF >> config/mysql/competitors.sql
   CREATE DATABASE IF NOT EXISTS \`${user}_${module}\`;
   CREATE USER IF NOT EXISTS '$user'@'%' IDENTIFIED BY '$pass';
   GRANT ALL PRIVILEGES ON \`${user}_${module}\`.* TO '$user'@'%';
@@ -131,6 +133,7 @@ EOF
   done
 done
 
+# Finalize competitors.yaml
 cat <<EOF >> competitors.yaml
 
 networks:
@@ -138,13 +141,9 @@ networks:
     external: true
 EOF
 
-# Start MySQL with the admin password as the root password
+# Start services
 MYSQL_ROOT_PASSWORD=$MYSQL_ROOT_PASSWORD docker compose -f mysql.yaml up -d
-
-# Start watchtower
 USERNAME=$USERNAME PASSWORD=$PASSWORD DOMAIN=$DOMAIN docker compose -f watchtower.yaml up -d
-
-# Start competitors work
 docker compose -f competitors.yaml up -d 
 
 echo "..all done!"

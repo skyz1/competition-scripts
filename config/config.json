@@ -1,0 +1,35 @@
+{
+  "domain": "17.blz-it.de",
+  "enable_https": true,
+  "username": "admin",
+  "password": "skill17",
+  "frameworks": [
+    {
+      "name": "laravel",
+      "url": "https://github.com/skill-setup/laravel-base.git"
+    },
+    {
+      "name": "vuejs",
+      "url": "https://github.com/skill-setup/vuejs-base.git"
+    },
+    {
+      "name": "react",
+      "url": "https://github.com/skill-setup/react-vite-js-base.git"
+    },
+    {
+      "name": "express",
+      "url": "https://github.com/skill-setup/expressjs-base.git"
+    },
+    {
+      "name": "next",
+      "url": "https://github.com/skill-setup/next-js-base.git"
+    }
+  ],
+  "competitors": [
+    {
+      "username": "comp1",
+      "password": "test",
+      "modules": ["familarization", "module-a", "module-b"]
+    }
+  ]
+}
